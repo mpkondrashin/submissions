@@ -43,6 +43,9 @@ const (
 	prefIgnoreTLS   = "ignore_tls"
 	prefOutputDir   = "output_dir"
 
+	apiCallInterval     = 1 * time.Millisecond
+	getReportGoroutines = 60
+
 	sourceID   = "303"
 	sourceName = "Submissions"
 )
@@ -811,41 +814,143 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 	srids := sridList.List.SRID
 
 	log.Printf("srid list size: %d", len(srids))
-	results := make([]reportRow, 0, len(srids))
+	results := make([]reportRow, len(srids))
 
-	for i, srid := range srids {
-		si, err := client.SampleInfo(ctx, srid)
-		if err != nil {
-			return fmt.Errorf("sample info srid=%s: %w", srid, err)
-		}
-
-		rep, err := client.GetReport(ctx, si.SHA1MessageID)
-		if err != nil {
-			return fmt.Errorf("get report sha1=%s: %w", si.SHA1MessageID, err)
-		}
-
-		var far *report27.FILEANALYZEREPORT
-		farLen := 0
-		if rep != nil {
-			farLen = len(rep.FILEANALYZEREPORT)
-			if farLen > 0 {
-				far = rep.FILEANALYZEREPORT[0]
+	rateTokens := make(chan struct{}, 1)
+	rateTokens <- struct{}{}
+	ticker := time.NewTicker(apiCallInterval)
+	defer ticker.Stop()
+	rateCtx, rateCancel := context.WithCancel(ctx)
+	defer rateCancel()
+	go func() {
+		for {
+			select {
+			case <-rateCtx.Done():
+				return
+			case <-ticker.C:
+				select {
+				case rateTokens <- struct{}{}:
+				default:
+				}
 			}
 		}
-		results = append(results, reportRow{
-			SRID:                 srid,
-			SampleInfo:           si,
-			FileAnalyzeReport:    far,
-			FileAnalyzeReportLen: farLen,
-		})
+	}()
 
-		idx := i + 1
-		total := len(srids)
-		setStatus(fmt.Sprintf("Downloaded %d/%d...", idx, total))
-		if total > 0 {
-			setProgress(0.3 + (0.6 * (float64(idx) / float64(total))))
+	acquireRate := func() error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-rateTokens:
+			return nil
 		}
 	}
+
+	type reportJob struct {
+		idx  int
+		srid string
+	}
+
+	jobs := make(chan reportJob)
+	completed := make(chan int, len(srids))
+	errCh := make(chan error, 1)
+
+	var wg sync.WaitGroup
+	workers := getReportGoroutines
+	if workers < 1 {
+		workers = 1
+	}
+	for wi := 0; wi < workers; wi++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				if err := acquireRate(); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					rateCancel()
+					return
+				}
+
+				si, err := client.SampleInfo(ctx, job.srid)
+				if err != nil {
+					select {
+					case errCh <- fmt.Errorf("sample info srid=%s: %w", job.srid, err):
+					default:
+					}
+					rateCancel()
+					return
+				}
+
+				if err := acquireRate(); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					rateCancel()
+					return
+				}
+
+				rep, err := client.GetReport(ctx, si.SHA1MessageID)
+				if err != nil {
+					select {
+					case errCh <- fmt.Errorf("get report sha1=%s: %w", si.SHA1MessageID, err):
+					default:
+					}
+					rateCancel()
+					return
+				}
+
+				var far *report27.FILEANALYZEREPORT
+				farLen := 0
+				if rep != nil {
+					farLen = len(rep.FILEANALYZEREPORT)
+					if farLen > 0 {
+						far = rep.FILEANALYZEREPORT[0]
+					}
+				}
+
+				results[job.idx].SRID = job.srid
+				results[job.idx].SampleInfo = si
+				results[job.idx].FileAnalyzeReport = far
+				results[job.idx].FileAnalyzeReportLen = farLen
+
+				completed <- job.idx
+			}
+		}()
+	}
+
+	for i, srid := range srids {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return ctx.Err()
+		case jobs <- reportJob{idx: i, srid: srid}:
+		}
+	}
+	close(jobs)
+
+	doneCount := 0
+	total := len(srids)
+	for doneCount < total {
+		select {
+		case err := <-errCh:
+			wg.Wait()
+			return err
+		case <-ctx.Done():
+			wg.Wait()
+			return ctx.Err()
+		case <-completed:
+			doneCount++
+			setStatus(fmt.Sprintf("Downloaded %d/%d...", doneCount, total))
+			if total > 0 {
+				setProgress(0.3 + (0.6 * (float64(doneCount) / float64(total))))
+			}
+		}
+	}
+	wg.Wait()
 
 	setStatus(fmt.Sprintf("Generating CSV (%d rows)...", len(results)))
 	setProgress(0.95)
