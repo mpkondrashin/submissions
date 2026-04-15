@@ -1,5 +1,7 @@
 # Submissions Downloader (Trend Micro Deep Discovery Analyzer)
 
+<img src="main.png" width="800"/>
+
 This project is a small wizard application that downloads submission data from **Trend Micro Deep Discovery Analyzer (DDAn)** and exports it to a **CSV** file.
 
 It supports:
