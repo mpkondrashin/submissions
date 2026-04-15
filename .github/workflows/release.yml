@@ -37,6 +37,17 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Configure git for private Go modules
+        shell: bash
+        env:
+          DDAN_READ_TOKEN: ${{ secrets.DDAN_READ_TOKEN }}
+        run: |
+          if [[ -z "${DDAN_READ_TOKEN}" ]]; then
+            echo "DDAN_READ_TOKEN secret is not set"
+            exit 1
+          fi
+          git config --global url."https://x-access-token:${DDAN_READ_TOKEN}@github.com/".insteadOf "https://github.com/"
+
       - name: Determine version
         id: ver
         shell: bash
@@ -45,6 +56,8 @@ jobs:
 
       - name: Build
         env:
+          GOPRIVATE: github.com/mpkondrashin/ddan
+          GONOSUMDB: github.com/mpkondrashin/ddan
           CGO_ENABLED: "1"
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
