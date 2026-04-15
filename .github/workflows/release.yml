@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.goos }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            runner: windows-latest
+            platform: windows
+            ext: .exe
+          - goos: darwin
+            goarch: amd64
+            runner: macos-latest
+            platform: macos
+            ext: ''
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Determine version
+        id: ver
+        shell: bash
+        run: |
+          echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        shell: bash
+        run: |
+          mkdir -p dist
+          go env
+          go build -v -o "dist/submissions${{ matrix.ext }}" .
+
+      - name: Package (zip)
+        shell: bash
+        run: |
+          mkdir -p dist_pkg
+          ZIP_NAME="submissions_${{ matrix.platform }}_${{ steps.ver.outputs.version }}.zip"
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            # include opengl32.dll alongside exe
+            cp opengl32.dll dist/
+          fi
+          (cd dist && zip -r "../dist_pkg/${ZIP_NAME}" .)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: submissions_${{ matrix.platform }}_${{ steps.ver.outputs.version }}
+          path: dist_pkg/submissions_${{ matrix.platform }}_${{ steps.ver.outputs.version }}.zip
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/submissions_*.zip
