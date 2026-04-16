@@ -77,6 +77,25 @@ type WizardApp struct {
 	registered   bool
 }
 
+type linkLabel struct {
+	*widget.Hyperlink
+	onTapped func()
+}
+
+func newLinkLabel(text string, onTapped func()) *linkLabel {
+	l := &linkLabel{
+		Hyperlink: widget.NewHyperlink(text, nil),
+		onTapped:  onTapped,
+	}
+	return l
+}
+
+func (l *linkLabel) Tapped(_ *fyne.PointEvent) {
+	if l.onTapped != nil {
+		l.onTapped()
+	}
+}
+
 func (w *WizardApp) stepHeader(step int, titleText, explanationText string) fyne.CanvasObject {
 	resName := fmt.Sprintf("image_%d.png", step+1)
 	b, err := embeddedImagesFS.ReadFile("images/" + resName)
@@ -614,14 +633,14 @@ func (w *WizardApp) showTimeIntervalScreen() {
 	content := container.NewVBox(
 		header,
 		widget.NewSeparator(),
+		layout.NewSpacer(),
 		container.NewVBox(
-			layout.NewSpacer(),
 			widget.NewLabel("Start Date:"),
 			startDateEntry,
 			widget.NewLabel("End Date:"),
 			endDateEntry,
-			layout.NewSpacer(),
 		),
+		layout.NewSpacer(),
 		//widget.NewSeparator(),
 	)
 
@@ -704,11 +723,12 @@ func (w *WizardApp) showOutputFolderScreen() {
 	content := container.NewVBox(
 		header,
 		widget.NewSeparator(),
+		layout.NewSpacer(),
 		folderLabel,
 		selectBtn,
 		widget.NewLabel("Output file name:"),
 		fileNameEntry,
-		//widget.NewSeparator(),
+		layout.NewSpacer(),
 	)
 
 	scrollContainer := container.NewScroll(container.NewPadded(content))
@@ -738,19 +758,28 @@ func (w *WizardApp) showDownloadScreen() {
 		widget.NewSeparator(),
 		container.NewPadded(container.NewHBox(backBtn)),
 	)
-
-	content := container.NewVBox(
-		header,
-		widget.NewSeparator(),
-		container.NewVBox(
-			layout.NewSpacer(),
-			progressBar,
-			statusLabel,
-			layout.NewSpacer(),
-		),
-		//widget.NewSeparator(),
+	form := container.NewVBox(
+		widget.NewLabel("Progress:"),
+		progressBar,
+		widget.NewLabel("Status:"),
+		statusLabel,
 	)
 
+	centered := container.New(
+		layout.NewVBoxLayout(),
+		layout.NewSpacer(),
+		form,
+		layout.NewSpacer(),
+	)
+
+	content := container.NewBorder(
+		container.NewVBox(
+			header,
+			widget.NewSeparator(),
+		),
+		nil, nil, nil,
+		container.New(layout.NewStackLayout(), centered),
+	)
 	scrollContainer := container.NewScroll(container.NewPadded(content))
 	w.window.SetContent(container.NewPadded(container.NewBorder(nil, buttonBar, nil, nil, scrollContainer)))
 
@@ -1010,14 +1039,14 @@ func (w *WizardApp) showCompletionScreen() {
 		"Download Complete!",
 		"Your CSV file has been generated successfully.")
 
-	fileLabel := widget.NewLabel("File: " + w.outputPath)
-	fileLabel.Wrapping = fyne.TextWrapWord
-
-	openBtn := widget.NewButton("Open CSV File", func() {
-		_ = openFile(w.outputPath)
-	})
-	openBtn.Importance = widget.HighImportance
-
+	fileLink := container.NewVBox(
+		widget.NewLabel("Result:"),
+		newLinkLabel(w.outputPath, func() {
+			if err := openFile(w.outputPath); err != nil {
+				dialog.ShowError(err, w.window)
+			}
+		}),
+	)
 	finishBtn := widget.NewButton("Finish", func() {
 		w.window.Close()
 	})
@@ -1033,9 +1062,9 @@ func (w *WizardApp) showCompletionScreen() {
 	content := container.NewVBox(
 		header,
 		widget.NewSeparator(),
-		fileLabel,
-		widget.NewSeparator(),
-		openBtn,
+		layout.NewSpacer(),
+		fileLink,
+		layout.NewSpacer(),
 	)
 
 	scrollContainer := container.NewScroll(container.NewPadded(content))
