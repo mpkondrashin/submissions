@@ -48,6 +48,9 @@ const (
 
 	sourceID   = "303"
 	sourceName = "Submissions"
+
+	WindowWidth  = 640
+	WindowHeight = 500
 )
 
 //go:embed images/*.png
@@ -92,10 +95,12 @@ func (w *WizardApp) stepHeader(step int, titleText, explanationText string) fyne
 	t := widget.NewLabelWithStyle(titleText, fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
 	ex := widget.NewLabel(explanationText)
 	ex.Wrapping = fyne.TextWrapWord
-	right := ex
 
-	// Use a Border layout so the text panel expands to fill the remaining width.
-	row := container.NewBorder(nil, nil, img, nil, right)
+	imgCol := container.NewVBox(img, layout.NewSpacer())
+	textCol := container.NewVBox(ex, layout.NewSpacer())
+	row := container.NewBorder(nil, nil, imgCol, nil,
+		container.NewVBox(layout.NewSpacer(), textCol, layout.NewSpacer()),
+	)
 	return container.NewVBox(t, row)
 }
 
@@ -241,7 +246,7 @@ func main() {
 	wizardApp.app = app.NewWithID("com.trendmicro.ddan.submissions")
 	wizardApp.app.SetIcon(nil)
 	wizardApp.window = wizardApp.app.NewWindow("Trend Micro DDAn Submissions Downloader")
-	wizardApp.window.Resize(fyne.NewSize(640, 480))
+	wizardApp.window.Resize(fyne.NewSize(WindowWidth, WindowHeight))
 	wizardApp.window.SetFixedSize(true)
 	wizardApp.window.CenterOnScreen()
 	wizardApp.initLogging()
@@ -286,18 +291,25 @@ func (w *WizardApp) showIntroScreen() {
 		"Trend Micro Deep Discovery Analyzer",
 		"This application will help you download submission data from Trend Micro Deep Discovery Analyzer and export it to a CSV file.")
 
-	subtitle := widget.NewLabelWithStyle("Submissions Downloader", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	subtitle := container.NewVBox(
+		layout.NewSpacer(),
+		widget.NewLabelWithStyle("Submissions Downloader", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		//layout.NewSpacer(),
+	)
 
 	continueBtn := widget.NewButton("Continue", func() {
 		w.showAPIKeyScreen()
 	})
 	continueBtn.Importance = widget.HighImportance
-	buttonBar := container.NewPadded(container.NewHBox(layout.NewSpacer(), continueBtn))
+
+	buttonBar := container.NewVBox(widget.NewSeparator(),
+		container.NewPadded(container.NewHBox(layout.NewSpacer(), continueBtn)),
+	)
 
 	content := container.NewVBox(
 		header,
 		subtitle,
-		widget.NewSeparator(),
+		//widget.NewSeparator(),
 	)
 
 	scrollContainer := container.NewScroll(container.NewPadded(content))
@@ -528,7 +540,9 @@ func (w *WizardApp) showAPIKeyScreen() {
 	backBtn := widget.NewButton("Back", func() {
 		w.showIntroScreen()
 	})
-	buttonBar := container.NewPadded(container.NewHBox(backBtn, layout.NewSpacer(), continueBtn))
+	buttonBar := container.NewVBox(widget.NewSeparator(),
+		container.NewPadded(container.NewHBox(backBtn, layout.NewSpacer(), continueBtn)),
+	)
 
 	content := container.NewVBox(
 		header,
@@ -538,10 +552,14 @@ func (w *WizardApp) showAPIKeyScreen() {
 		widget.NewLabel("API Key:"),
 		apiKeyEntry,
 		ignoreTLSCheck,
-		widget.NewSeparator(),
+		//widget.NewSeparator(),
 	)
 
-	scrollContainer := container.NewScroll(container.NewPadded(content))
+	scrollContainer := container.NewScroll(container.NewPadded(container.NewVBox(
+		layout.NewSpacer(),
+		content,
+		layout.NewSpacer(),
+	)))
 	w.window.SetContent(container.NewPadded(container.NewBorder(nil, buttonBar, nil, nil, scrollContainer)))
 }
 
@@ -588,19 +606,32 @@ func (w *WizardApp) showTimeIntervalScreen() {
 	backBtn := widget.NewButton("Back", func() {
 		w.showAPIKeyScreen()
 	})
-	buttonBar := container.NewPadded(container.NewHBox(backBtn, layout.NewSpacer(), continueBtn))
+	buttonBar := container.NewVBox(
+		widget.NewSeparator(),
+		container.NewPadded(container.NewHBox(backBtn, layout.NewSpacer(), continueBtn)),
+	)
 
 	content := container.NewVBox(
 		header,
 		widget.NewSeparator(),
-		widget.NewLabel("Start Date:"),
-		startDateEntry,
-		widget.NewLabel("End Date:"),
-		endDateEntry,
-		widget.NewSeparator(),
+		container.NewVBox(
+			layout.NewSpacer(),
+			widget.NewLabel("Start Date:"),
+			startDateEntry,
+			widget.NewLabel("End Date:"),
+			endDateEntry,
+			layout.NewSpacer(),
+		),
+		//widget.NewSeparator(),
 	)
 
-	scrollContainer := container.NewScroll(container.NewPadded(content))
+	scrollContainer := container.NewScroll(container.NewPadded(
+		//container.NewVBox(
+		//	layout.NewSpacer(),
+		content,
+		//	layout.NewSpacer(),
+		//)
+	))
 	w.window.SetContent(container.NewPadded(container.NewBorder(nil, buttonBar, nil, nil, scrollContainer)))
 }
 
@@ -665,7 +696,10 @@ func (w *WizardApp) showOutputFolderScreen() {
 	backBtn := widget.NewButton("Back", func() {
 		w.showTimeIntervalScreen()
 	})
-	buttonBar := container.NewPadded(container.NewHBox(backBtn, layout.NewSpacer(), continueBtn))
+	buttonBar := container.NewVBox(
+		widget.NewSeparator(),
+		container.NewPadded(container.NewHBox(backBtn, layout.NewSpacer(), continueBtn)),
+	)
 
 	content := container.NewVBox(
 		header,
@@ -674,7 +708,7 @@ func (w *WizardApp) showOutputFolderScreen() {
 		selectBtn,
 		widget.NewLabel("Output file name:"),
 		fileNameEntry,
-		widget.NewSeparator(),
+		//widget.NewSeparator(),
 	)
 
 	scrollContainer := container.NewScroll(container.NewPadded(content))
@@ -700,14 +734,21 @@ func (w *WizardApp) showDownloadScreen() {
 	backBtn := widget.NewButton("Back", func() {
 		w.showOutputFolderScreen()
 	})
-	buttonBar := container.NewPadded(container.NewHBox(backBtn))
+	buttonBar := container.NewVBox(
+		widget.NewSeparator(),
+		container.NewPadded(container.NewHBox(backBtn)),
+	)
 
 	content := container.NewVBox(
 		header,
 		widget.NewSeparator(),
-		progressBar,
-		statusLabel,
-		widget.NewSeparator(),
+		container.NewVBox(
+			layout.NewSpacer(),
+			progressBar,
+			statusLabel,
+			layout.NewSpacer(),
+		),
+		//widget.NewSeparator(),
 	)
 
 	scrollContainer := container.NewScroll(container.NewPadded(content))
@@ -984,7 +1025,10 @@ func (w *WizardApp) showCompletionScreen() {
 	newDownloadBtn := widget.NewButton("Start New Download", func() {
 		w.showIntroScreen()
 	})
-	buttonBar := container.NewPadded(container.NewHBox(newDownloadBtn, layout.NewSpacer(), finishBtn))
+	buttonBar := container.NewVBox(
+		widget.NewSeparator(),
+		container.NewPadded(container.NewHBox(newDownloadBtn, layout.NewSpacer(), finishBtn)),
+	)
 
 	content := container.NewVBox(
 		header,
