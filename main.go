@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -44,7 +45,8 @@ const (
 	prefOutputDir   = "output_dir"
 
 	apiCallInterval     = 1 * time.Millisecond
-	getReportGoroutines = 60
+	getReportGoroutines = 3
+	apiLogEvery         = uint64(1)
 
 	sourceID   = "303"
 	sourceName = "Submissions"
@@ -94,6 +96,94 @@ func (l *linkLabel) Tapped(_ *fyne.PointEvent) {
 	if l.onTapped != nil {
 		l.onTapped()
 	}
+}
+
+func addFlattenSchemaKeys(prefix string, t reflect.Type, out map[string]struct{}, opts flattenOptions) {
+	if t == nil {
+		return
+	}
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+		if t == nil {
+			return
+		}
+	}
+
+	switch t.Kind() {
+	case reflect.Struct:
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if f.PkgPath != "" {
+				continue
+			}
+			key := prefix + "_" + strings.ToLower(f.Name)
+			addFlattenSchemaKeys(key, f.Type, out, opts)
+		}
+		return
+	case reflect.Slice, reflect.Array, reflect.Map:
+		if !opts.IncludeLists {
+			return
+		}
+		if _, ok := opts.IgnoreListFieldKeys[prefix]; ok {
+			return
+		}
+		out[prefix] = struct{}{}
+		return
+	case reflect.Interface:
+		out[prefix] = struct{}{}
+		return
+	default:
+		out[prefix] = struct{}{}
+		return
+	}
+}
+
+func buildCSVHeader() []string {
+	keysSet := make(map[string]struct{})
+	keysSet["file_analyze_report_len"] = struct{}{}
+
+	addFlattenSchemaKeys("sample", reflect.TypeOf(ddan.SampleInfo{}), keysSet, flattenOptions{
+		IncludeLists: true,
+		IgnoreListFieldKeys: map[string]struct{}{
+			"sample_attachments": {},
+			"attachments":        {},
+		},
+	})
+	addFlattenSchemaKeys("file", reflect.TypeOf(report27.FILEANALYZEREPORT{}), keysSet, flattenOptions{IncludeLists: false})
+
+	keys := make([]string, 0, len(keysSet))
+	for k := range keysSet {
+		if k == "srid" {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	header := make([]string, 0, 1+len(keys))
+	header = append(header, "srid")
+	header = append(header, keys...)
+	return header
+}
+
+func reportRowToMap(r reportRow) map[string]string {
+	m := map[string]string{
+		"srid":                    r.SRID,
+		"file_analyze_report_len": fmt.Sprintf("%d", r.FileAnalyzeReportLen),
+	}
+	if r.SampleInfo != nil {
+		flattenFieldsWithOptions("sample", reflect.ValueOf(r.SampleInfo), m, flattenOptions{
+			IncludeLists: true,
+			IgnoreListFieldKeys: map[string]struct{}{
+				"sample_attachments": {},
+				"attachments":        {},
+			},
+		})
+	}
+	if r.FileAnalyzeReport != nil {
+		flattenFieldsWithOptions("file", reflect.ValueOf(r.FileAnalyzeReport), m, flattenOptions{IncludeLists: false})
+	}
+	return m
 }
 
 func (w *WizardApp) stepHeader(step int, titleText, explanationText string) fyne.CanvasObject {
@@ -884,7 +974,22 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 	srids := sridList.List.SRID
 
 	log.Printf("srid list size: %d", len(srids))
-	results := make([]reportRow, len(srids))
+	if err := os.MkdirAll(filepath.Dir(w.outputPath), 0o755); err != nil {
+		return err
+	}
+	f, err := os.Create(w.outputPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	writer := csv.NewWriter(f)
+	defer writer.Flush()
+
+	header := buildCSVHeader()
+	if err := writer.Write(header); err != nil {
+		return err
+	}
 
 	rateTokens := make(chan struct{}, 1)
 	rateTokens <- struct{}{}
@@ -920,15 +1025,18 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 		srid string
 	}
 
-	jobs := make(chan reportJob)
-	completed := make(chan int, len(srids))
-	errCh := make(chan error, 1)
-
-	var wg sync.WaitGroup
 	workers := getReportGoroutines
 	if workers < 1 {
 		workers = 1
 	}
+
+	jobs := make(chan reportJob)
+	completed := make(chan int, len(srids))
+	errCh := make(chan error, 1)
+	rowsCh := make(chan reportRow, workers)
+	var apiSeq uint64
+
+	var wg sync.WaitGroup
 	for wi := 0; wi < workers; wi++ {
 		wg.Add(1)
 		go func() {
@@ -943,6 +1051,10 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 					return
 				}
 
+				n := atomic.AddUint64(&apiSeq, 1)
+				if apiLogEvery > 0 && n%apiLogEvery == 0 {
+					log.Printf("api[%d]: SampleInfo srid=%s", n, job.srid)
+				}
 				si, err := client.SampleInfo(ctx, job.srid)
 				if err != nil {
 					select {
@@ -962,6 +1074,10 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 					return
 				}
 
+				n = atomic.AddUint64(&apiSeq, 1)
+				if apiLogEvery > 0 && n%apiLogEvery == 0 {
+					log.Printf("api[%d]: GetReport sha1=%s srid=%s", n, si.SHA1MessageID, job.srid)
+				}
 				rep, err := client.GetReport(ctx, si.SHA1MessageID)
 				if err != nil {
 					select {
@@ -981,21 +1097,51 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 					}
 				}
 
-				results[job.idx].SRID = job.srid
-				results[job.idx].SampleInfo = si
-				results[job.idx].FileAnalyzeReport = far
-				results[job.idx].FileAnalyzeReportLen = farLen
-
+				rowsCh <- reportRow{
+					SRID:                 job.srid,
+					SampleInfo:           si,
+					FileAnalyzeReport:    far,
+					FileAnalyzeReportLen: farLen,
+				}
 				completed <- job.idx
 			}
 		}()
 	}
+
+	var writeWG sync.WaitGroup
+	writeWG.Add(1)
+	go func() {
+		defer writeWG.Done()
+		written := 0
+		for r := range rowsCh {
+			m := reportRowToMap(r)
+			rec := make([]string, 0, len(header))
+			for _, k := range header {
+				rec = append(rec, m[k])
+			}
+			if err := writer.Write(rec); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				rateCancel()
+				return
+			}
+			written++
+			if written == 1 || written%100 == 0 {
+				log.Printf("csv: written rows=%d", written)
+			}
+		}
+		log.Printf("csv: writer done rows=%d", written)
+	}()
 
 	for i, srid := range srids {
 		select {
 		case <-ctx.Done():
 			close(jobs)
 			wg.Wait()
+			close(rowsCh)
+			writeWG.Wait()
 			return ctx.Err()
 		case jobs <- reportJob{idx: i, srid: srid}:
 		}
@@ -1008,9 +1154,13 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 		select {
 		case err := <-errCh:
 			wg.Wait()
+			close(rowsCh)
+			writeWG.Wait()
 			return err
 		case <-ctx.Done():
 			wg.Wait()
+			close(rowsCh)
+			writeWG.Wait()
 			return ctx.Err()
 		case <-completed:
 			doneCount++
@@ -1018,17 +1168,23 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 			if total > 0 {
 				setProgress(0.3 + (0.6 * (float64(doneCount) / float64(total))))
 			}
+			if doneCount == 1 || doneCount%100 == 0 {
+				log.Printf("progress: downloaded %d/%d", doneCount, total)
+			}
 		}
 	}
 	wg.Wait()
+	close(rowsCh)
+	writeWG.Wait()
 
-	setStatus(fmt.Sprintf("Generating CSV (%d rows)...", len(results)))
-	setProgress(0.95)
-
-	if err := w.generateCSV(results); err != nil {
-		return fmt.Errorf("generate csv: %w", err)
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return err
 	}
-	log.Printf("csv generated: %q rows=%d", w.outputPath, len(results))
+
+	setStatus("Finalizing...")
+	setProgress(0.95)
+	log.Printf("csv generated: %q rows=%d", w.outputPath, total)
 	return nil
 }
 
