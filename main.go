@@ -45,8 +45,9 @@ const (
 	prefOutputDir   = "output_dir"
 
 	apiCallInterval     = 1 * time.Millisecond
-	getReportGoroutines = 3
+	getReportGoroutines = 60
 	apiLogEvery         = uint64(1)
+	apiLogMinInterval   = 500 * time.Millisecond
 
 	sourceID   = "303"
 	sourceName = "Submissions"
@@ -874,6 +875,7 @@ func (w *WizardApp) showDownloadScreen() {
 	w.window.SetContent(container.NewPadded(container.NewBorder(nil, buttonBar, nil, nil, scrollContainer)))
 
 	// Integrate with DDAn API and generate CSV
+	backBtn.Disable()
 	go w.downloadAndGenerateCSV(progressData, statusData)
 }
 
@@ -990,6 +992,10 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 	if err := writer.Write(header); err != nil {
 		return err
 	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return err
+	}
 
 	rateTokens := make(chan struct{}, 1)
 	rateTokens <- struct{}{}
@@ -1030,11 +1036,16 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 		workers = 1
 	}
 
-	jobs := make(chan reportJob)
+	jobBuf := len(srids)
+	if jobBuf < 1 {
+		jobBuf = 1
+	}
+	jobs := make(chan reportJob, jobBuf)
 	completed := make(chan int, len(srids))
 	errCh := make(chan error, 1)
 	rowsCh := make(chan reportRow, workers)
 	var apiSeq uint64
+	var lastAPILogNano int64
 
 	var wg sync.WaitGroup
 	for wi := 0; wi < workers; wi++ {
@@ -1053,7 +1064,11 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 
 				n := atomic.AddUint64(&apiSeq, 1)
 				if apiLogEvery > 0 && n%apiLogEvery == 0 {
-					log.Printf("api[%d]: SampleInfo srid=%s", n, job.srid)
+					now := time.Now().UnixNano()
+					last := atomic.LoadInt64(&lastAPILogNano)
+					if now-last >= apiLogMinInterval.Nanoseconds() && atomic.CompareAndSwapInt64(&lastAPILogNano, last, now) {
+						log.Printf("api[%d]: SampleInfo srid=%s", n, job.srid)
+					}
 				}
 				si, err := client.SampleInfo(ctx, job.srid)
 				if err != nil {
@@ -1076,7 +1091,11 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 
 				n = atomic.AddUint64(&apiSeq, 1)
 				if apiLogEvery > 0 && n%apiLogEvery == 0 {
-					log.Printf("api[%d]: GetReport sha1=%s srid=%s", n, si.SHA1MessageID, job.srid)
+					now := time.Now().UnixNano()
+					last := atomic.LoadInt64(&lastAPILogNano)
+					if now-last >= apiLogMinInterval.Nanoseconds() && atomic.CompareAndSwapInt64(&lastAPILogNano, last, now) {
+						log.Printf("api[%d]: GetReport sha1=%s srid=%s", n, si.SHA1MessageID, job.srid)
+					}
 				}
 				rep, err := client.GetReport(ctx, si.SHA1MessageID)
 				if err != nil {
@@ -1128,13 +1147,35 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 				return
 			}
 			written++
+			if written%100 == 0 {
+				writer.Flush()
+				if err := writer.Error(); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					rateCancel()
+					return
+				}
+			}
 			if written == 1 || written%100 == 0 {
 				log.Printf("csv: written rows=%d", written)
 			}
 		}
+		writer.Flush()
+		if err := writer.Error(); err != nil {
+			select {
+			case errCh <- err:
+			default:
+			}
+			rateCancel()
+			return
+		}
 		log.Printf("csv: writer done rows=%d", written)
 	}()
 
+	queued := 0
+	total := len(srids)
 	for i, srid := range srids {
 		select {
 		case <-ctx.Done():
@@ -1145,11 +1186,15 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 			return ctx.Err()
 		case jobs <- reportJob{idx: i, srid: srid}:
 		}
+		queued++
+		setStatus(fmt.Sprintf("Queued %d/%d...", queued, total))
+		if total > 0 {
+			setProgress(0.3 + (0.3 * (float64(queued) / float64(total))))
+		}
 	}
 	close(jobs)
 
 	doneCount := 0
-	total := len(srids)
 	for doneCount < total {
 		select {
 		case err := <-errCh:
@@ -1166,7 +1211,7 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 			doneCount++
 			setStatus(fmt.Sprintf("Downloaded %d/%d...", doneCount, total))
 			if total > 0 {
-				setProgress(0.3 + (0.6 * (float64(doneCount) / float64(total))))
+				setProgress(0.6 + (0.3 * (float64(doneCount) / float64(total))))
 			}
 			if doneCount == 1 || doneCount%100 == 0 {
 				log.Printf("progress: downloaded %d/%d", doneCount, total)
