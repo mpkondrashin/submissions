@@ -73,6 +73,7 @@ type WizardApp struct {
 	outputName    string
 	startDate     string
 	endDate       string
+	logPath       string
 	logFile       *os.File
 
 	mu           sync.Mutex
@@ -308,6 +309,7 @@ func main() {
 	cliEnd := flag.String("end", "", "end date (YYYY-MM-DD)")
 	cliOutput := flag.String("output", "", "output CSV file path")
 	cliUUID := flag.String("uuid", "", "client UUID (optional)")
+	cliLog := flag.String("log", "", "log file path (default: submissions_<date>.log next to executable)")
 	flag.Parse()
 
 	if *cli {
@@ -319,8 +321,10 @@ func main() {
 		w.endDate = strings.TrimSpace(*cliEnd)
 		w.outputPath = strings.TrimSpace(*cliOutput)
 		w.clientUUID = strings.TrimSpace(*cliUUID)
+		w.logPath = strings.TrimSpace(*cliLog)
 		w.ensureDefaultDates()
 		w.initLogging()
+		defer w.closeLogging()
 
 		apiKey := strings.TrimSpace(os.Getenv("ANALYZER_API_KEY"))
 		if apiKey == "" {
@@ -353,6 +357,7 @@ func main() {
 
 	wizardApp := &WizardApp{}
 	wizardApp.verbose = *verbose
+	wizardApp.logPath = strings.TrimSpace(*cliLog)
 	wizardApp.app = app.NewWithID("com.trendmicro.ddan.submissions")
 	wizardApp.app.SetIcon(nil)
 	wizardApp.window = wizardApp.app.NewWindow("Trend Micro DDAn Submissions Downloader")
@@ -365,6 +370,7 @@ func main() {
 	wizardApp.window.SetCloseIntercept(func() {
 		log.Printf("window close intercept")
 		wizardApp.bestEffortUnregister()
+		wizardApp.closeLogging()
 		wizardApp.window.Close()
 	})
 
@@ -375,7 +381,72 @@ func main() {
 
 func (w *WizardApp) initLogging() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("logging started")
+
+	exeDir := w.exeDir()
+	_ = cleanupOldLogs(exeDir, 30*24*time.Hour)
+
+	if strings.TrimSpace(w.logPath) == "" {
+		w.logPath = filepath.Join(exeDir, fmt.Sprintf("submissions_%s.log", time.Now().Format("2006-01-02")))
+	}
+	if err := os.MkdirAll(filepath.Dir(w.logPath), 0o755); err != nil {
+		log.Printf("error: create log dir: %v", err)
+		return
+	}
+	f, err := os.OpenFile(w.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		log.Printf("error: open log file %q: %v", w.logPath, err)
+		return
+	}
+	w.logFile = f
+	os.Stdout = f
+	os.Stderr = f
+	log.SetOutput(f)
+	log.Printf("logging started: %s", w.logPath)
+}
+
+func (w *WizardApp) closeLogging() {
+	if w.logFile == nil {
+		return
+	}
+	_ = w.logFile.Close()
+	w.logFile = nil
+}
+
+func (w *WizardApp) exeDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	if exe == "" {
+		return "."
+	}
+	return filepath.Dir(exe)
+}
+
+func cleanupOldLogs(dir string, maxAge time.Duration) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	cutoff := time.Now().Add(-maxAge)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, "submissions_") || !strings.HasSuffix(name, ".log") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, name))
+	}
+	return nil
 }
 
 func (w *WizardApp) bestEffortUnregister() {
