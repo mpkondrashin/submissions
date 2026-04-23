@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -48,6 +49,7 @@ const (
 	getReportGoroutines = 60
 	apiLogEvery         = uint64(1)
 	apiLogMinInterval   = 500 * time.Millisecond
+	apiCallTimeout      = 2 * time.Minute
 
 	sourceID   = "303"
 	sourceName = "Submissions"
@@ -143,6 +145,7 @@ func addFlattenSchemaKeys(prefix string, t reflect.Type, out map[string]struct{}
 func buildCSVHeader() []string {
 	keysSet := make(map[string]struct{})
 	keysSet["file_analyze_report_len"] = struct{}{}
+	keysSet["download_error"] = struct{}{}
 
 	addFlattenSchemaKeys("sample", reflect.TypeOf(ddan.SampleInfo{}), keysSet, flattenOptions{
 		IncludeLists: true,
@@ -172,6 +175,7 @@ func reportRowToMap(r reportRow) map[string]string {
 	m := map[string]string{
 		"srid":                    r.SRID,
 		"file_analyze_report_len": fmt.Sprintf("%d", r.FileAnalyzeReportLen),
+		"download_error":          r.DownloadError,
 	}
 	if r.SampleInfo != nil {
 		flattenFieldsWithOptions("sample", reflect.ValueOf(r.SampleInfo), m, flattenOptions{
@@ -502,6 +506,7 @@ type reportRow struct {
 	SampleInfo           any
 	FileAnalyzeReport    *report27.FILEANALYZEREPORT
 	FileAnalyzeReportLen int
+	DownloadError        string
 }
 
 func xmlOrFieldName(sf reflect.StructField) string {
@@ -1002,14 +1007,20 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 	w.registered = false
 	w.mu.Unlock()
 
-	if err := client.TestConnection(ctx); err != nil {
+	testCtx, testCancel := context.WithTimeout(ctx, apiCallTimeout)
+	if err := client.TestConnection(testCtx); err != nil {
+		testCancel()
 		return fmt.Errorf("test connection: %w", err)
 	}
+	testCancel()
 
 	setStatus("Registering...")
-	if err := client.Register(ctx); err != nil {
+	regCtx, regCancel := context.WithTimeout(ctx, apiCallTimeout)
+	if err := client.Register(regCtx); err != nil {
+		regCancel()
 		return fmt.Errorf("register: %w", err)
 	}
+	regCancel()
 	log.Printf("registered")
 
 	w.mu.Lock()
@@ -1040,7 +1051,9 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 	// Use QuerySampleList to retrieve SRIDs for the interval.
 	intervalStart := startTime
 	intervalEnd := endTime.Add(24 * time.Hour)
-	sridList, err := client.QuerySampleList(ctx, intervalStart, intervalEnd, "all")
+	listCtx, listCancel := context.WithTimeout(ctx, apiCallTimeout)
+	sridList, err := client.QuerySampleList(listCtx, intervalStart, intervalEnd, "all")
+	listCancel()
 	if err != nil {
 		return fmt.Errorf("query sample list: %w", err)
 	}
@@ -1141,8 +1154,15 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 						log.Printf("api[%d]: SampleInfo srid=%s", n, job.srid)
 					}
 				}
-				si, err := client.SampleInfo(ctx, job.srid)
+				siCtx, siCancel := context.WithTimeout(ctx, apiCallTimeout)
+				si, err := client.SampleInfo(siCtx, job.srid)
+				siCancel()
 				if err != nil {
+					if errors.Is(err, context.DeadlineExceeded) {
+						rowsCh <- reportRow{SRID: job.srid, DownloadError: err.Error()}
+						completed <- job.idx
+						continue
+					}
 					select {
 					case errCh <- fmt.Errorf("sample info srid=%s: %w", job.srid, err):
 					default:
@@ -1168,8 +1188,15 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 						log.Printf("api[%d]: GetReport sha1=%s srid=%s", n, si.SHA1MessageID, job.srid)
 					}
 				}
-				rep, err := client.GetReport(ctx, si.SHA1MessageID)
+				repCtx, repCancel := context.WithTimeout(ctx, apiCallTimeout)
+				rep, err := client.GetReport(repCtx, si.SHA1MessageID)
+				repCancel()
 				if err != nil {
+					if errors.Is(err, context.DeadlineExceeded) {
+						rowsCh <- reportRow{SRID: job.srid, SampleInfo: si, DownloadError: err.Error()}
+						completed <- job.idx
+						continue
+					}
 					select {
 					case errCh <- fmt.Errorf("get report sha1=%s: %w", si.SHA1MessageID, err):
 					default:
