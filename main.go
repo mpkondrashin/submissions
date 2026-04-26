@@ -1011,7 +1011,12 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 		return fmt.Errorf("invalid analyzer url %q: %w", analyzerURL, err)
 	}
 
-	client := ddan.NewClient("submissions-downloader", u.Hostname())
+	localHost, err := os.Hostname()
+	if err != nil || strings.TrimSpace(localHost) == "" {
+		localHost = "localhost"
+	}
+
+	client := ddan.NewClient("submissions-downloader", localHost)
 	client.SetAnalyzer(u, w.apiKey, w.ignoreTLS)
 	client.SetSource(sourceID, sourceName)
 	client.SetUUID(w.ensureClientUUID())
