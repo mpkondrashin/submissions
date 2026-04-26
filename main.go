@@ -46,10 +46,19 @@ const (
 	prefOutputDir   = "output_dir"
 
 	apiCallInterval     = 1 * time.Millisecond
-	getReportGoroutines = 60
-	apiLogEvery         = uint64(1)
-	apiLogMinInterval   = 500 * time.Millisecond
-	apiCallTimeout      = 2 * time.Minute
+	getReportGoroutines = 60                     // concurrent workers for SampleInfo/GetReport; higher = faster, but more load on analyzer and local CPU
+	apiLogEvery         = uint64(1)              // log every N-th API call (1 = log each call); increase to reduce log volume
+	apiLogMinInterval   = 500 * time.Millisecond // minimum interval between API log lines even if apiLogEvery would allow more
+	apiCallTimeout      = 2 * time.Minute        // per API call timeout; prevents a single hung request from stalling the whole export
+	stallTimeout        = 5 * time.Minute        // abort export if no SRID completes / rows are written for this long (covers SDK/network hangs that ignore context)
+
+	progressConnect    = 0.02 // progress after connecting starts; should be < progressListStart
+	progressListStart  = 0.05 // progress when "Fetching submission list" starts; should be > progressConnect and <= progressDoneStart
+	progressQueueSpan  = 0.05 // additional progress allocated to queuing SRIDs; progressListStart+progressQueueSpan should be <= progressDoneStart
+	progressDoneStart  = 0.10 // base progress for per-SRID completion phase; should be >= progressListStart+progressQueueSpan
+	progressDoneSpan   = 0.85 // additional progress allocated to per-SRID downloads; progressDoneStart+progressDoneSpan should be < progressFinalizing
+	progressFinalizing = 0.95 // progress during final flush/cleanup; should be > progressDoneStart+progressDoneSpan and < progressComplete
+	progressComplete   = 1.0  // progress value for completion; should be 1.0
 
 	sourceID   = "303"
 	sourceName = "Submissions"
@@ -205,7 +214,7 @@ func (w *WizardApp) stepHeader(step int, titleText, explanationText string) fyne
 	imgRes := fyne.NewStaticResource(resName, b)
 	img := canvas.NewImageFromResource(imgRes)
 	img.FillMode = canvas.ImageFillContain
-	img.SetMinSize(fyne.NewSize(280, 160))
+	img.SetMinSize(fyne.NewSize(160, 160))
 
 	t := widget.NewLabelWithStyle(titleText, fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
 	ex := widget.NewLabel(explanationText)
@@ -952,10 +961,10 @@ func (w *WizardApp) showDownloadScreen() {
 
 	// Integrate with DDAn API and generate CSV
 	backBtn.Disable()
-	go w.downloadAndGenerateCSV(progressData, statusData)
+	go w.downloadAndGenerateCSV(progressData, statusData, backBtn)
 }
 
-func (w *WizardApp) downloadAndGenerateCSV(progressData binding.Float, statusData binding.String) {
+func (w *WizardApp) downloadAndGenerateCSV(progressData binding.Float, statusData binding.String, backBtn *widget.Button) {
 	ctx := context.Background()
 	if w.verbose {
 		ctx = ddan.VerboseContext(ctx, func(line string) {
@@ -968,11 +977,16 @@ func (w *WizardApp) downloadAndGenerateCSV(progressData binding.Float, statusDat
 	if err := w.runExport(ctx, setProgress, setStatus); err != nil {
 		setStatus("Error: " + err.Error())
 		log.Printf("error: export: %v", err)
+		if backBtn != nil {
+			fyne.Do(func() {
+				backBtn.Enable()
+			})
+		}
 		return
 	}
 
 	setStatus("Download complete!")
-	setProgress(1.0)
+	setProgress(progressComplete)
 	log.Printf("download complete")
 
 	// Show completion screen after a short delay
@@ -986,7 +1000,7 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 	log.Printf("download start: analyzer_url=%q ignore_tls=%v start=%s end=%s output=%q", w.analyzerURL, w.ignoreTLS, w.startDate, w.endDate, w.outputPath)
 
 	setStatus("Connecting to DDAn API...")
-	setProgress(0.1)
+	setProgress(progressConnect)
 
 	analyzerURL := strings.TrimSpace(w.analyzerURL)
 	if !strings.Contains(analyzerURL, "://") {
@@ -1036,7 +1050,7 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 	}()
 
 	setStatus("Fetching submission list...")
-	setProgress(0.3)
+	setProgress(progressListStart)
 
 	startTime, err := time.Parse("2006-01-02", w.startDate)
 	if err != nil {
@@ -1231,6 +1245,7 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 		defer writeWG.Done()
 		written := 0
 		for r := range rowsCh {
+			atomic.StoreInt64(&lastAPILogNano, time.Now().UnixNano())
 			m := reportRowToMap(r)
 			rec := make([]string, 0, len(header))
 			for _, k := range header {
@@ -1274,6 +1289,10 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 
 	queued := 0
 	total := len(srids)
+	stallTicker := time.NewTicker(30 * time.Second)
+	defer stallTicker.Stop()
+	var lastProgressNano int64
+	atomic.StoreInt64(&lastProgressNano, time.Now().UnixNano())
 	for i, srid := range srids {
 		select {
 		case <-ctx.Done():
@@ -1287,12 +1306,14 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 		queued++
 		setStatus(fmt.Sprintf("Queued %d/%d...", queued, total))
 		if total > 0 {
-			setProgress(0.3 + (0.3 * (float64(queued) / float64(total))))
+			setProgress(progressListStart + (progressQueueSpan * (float64(queued) / float64(total))))
 		}
 	}
 	close(jobs)
 
 	doneCount := 0
+	lastUIUpdateNano := int64(0)
+	uiUpdateMinInterval := 200 * time.Millisecond
 	for doneCount < total {
 		select {
 		case err := <-errCh:
@@ -1307,12 +1328,27 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 			return ctx.Err()
 		case <-completed:
 			doneCount++
-			setStatus(fmt.Sprintf("Downloaded %d/%d...", doneCount, total))
-			if total > 0 {
-				setProgress(0.6 + (0.3 * (float64(doneCount) / float64(total))))
+			atomic.StoreInt64(&lastProgressNano, time.Now().UnixNano())
+			now := time.Now().UnixNano()
+			last := atomic.LoadInt64(&lastUIUpdateNano)
+			if doneCount == 1 || doneCount == total || now-last >= uiUpdateMinInterval.Nanoseconds() {
+				if atomic.CompareAndSwapInt64(&lastUIUpdateNano, last, now) {
+					setStatus(fmt.Sprintf("Downloaded %d/%d...", doneCount, total))
+					if total > 0 {
+						setProgress(progressDoneStart + (progressDoneSpan * (float64(doneCount) / float64(total))))
+					}
+				}
 			}
 			if doneCount == 1 || doneCount%100 == 0 {
 				log.Printf("progress: downloaded %d/%d", doneCount, total)
+			}
+		case <-stallTicker.C:
+			last := atomic.LoadInt64(&lastProgressNano)
+			if time.Since(time.Unix(0, last)) >= stallTimeout {
+				wg.Wait()
+				close(rowsCh)
+				writeWG.Wait()
+				return fmt.Errorf("stalled for %s without progress", stallTimeout)
 			}
 		}
 	}
@@ -1326,7 +1362,7 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 	}
 
 	setStatus("Finalizing...")
-	setProgress(0.95)
+	setProgress(progressFinalizing)
 	log.Printf("csv generated: %q rows=%d", w.outputPath, total)
 	return nil
 }
