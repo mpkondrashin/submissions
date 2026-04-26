@@ -72,6 +72,8 @@ const (
 //go:embed images/*.png
 var embeddedImagesFS embed.FS
 
+var appVersion = "dev"
+
 type WizardApp struct {
 	app           fyne.App
 	window        fyne.Window
@@ -459,7 +461,10 @@ func (w *WizardApp) initLogging() {
 	os.Stdout = f
 	os.Stderr = f
 	log.SetOutput(f)
+	host, _ := os.Hostname()
 	log.Printf("logging started: %s", w.logPath)
+	log.Printf("app: version=%s os=%s arch=%s host=%q", appVersion, runtime.GOOS, runtime.GOARCH, strings.TrimSpace(host))
+	log.Printf("config: workers=%d api_interval=%s api_timeout=%s stall_timeout=%s api_log_every=%d api_log_min_interval=%s", getReportGoroutines, apiCallInterval, apiCallTimeout, stallTimeout, apiLogEvery, apiLogMinInterval)
 }
 
 func (w *WizardApp) closeLogging() {
@@ -1044,7 +1049,7 @@ func (w *WizardApp) downloadAndGenerateCSV(progressData binding.Float, statusDat
 }
 
 func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), setStatus func(string)) error {
-	log.Printf("download start: analyzer_url=%q ignore_tls=%v start=%s end=%s output=%q", w.analyzerURL, w.ignoreTLS, w.startDate, w.endDate, w.outputPath)
+	log.Printf("download start: version=%s analyzer_url=%q ignore_tls=%v start=%s end=%s output=%q workers=%d api_interval=%s api_timeout=%s stall_timeout=%s", appVersion, w.analyzerURL, w.ignoreTLS, w.startDate, w.endDate, w.outputPath, getReportGoroutines, apiCallInterval, apiCallTimeout, stallTimeout)
 
 	setStatus("Connecting to DDAn API...")
 	setProgress(progressConnect)
@@ -1220,6 +1225,8 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 	rowsCh := make(chan reportRow, workers)
 	var apiSeq uint64
 	var lastAPILogNano int64
+	var lastProgressNano int64
+	atomic.StoreInt64(&lastProgressNano, time.Now().UnixNano())
 
 	var wg sync.WaitGroup
 	for wi := 0; wi < workers; wi++ {
@@ -1336,20 +1343,17 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 				return
 			}
 			written++
-			if written%100 == 0 {
-				writer.Flush()
-				if err := writer.Error(); err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-					rateCancel()
-					return
+			atomic.StoreInt64(&lastProgressNano, time.Now().UnixNano())
+			writer.Flush()
+			if err := writer.Error(); err != nil {
+				select {
+				case errCh <- err:
+				default:
 				}
+				rateCancel()
+				return
 			}
-			if written == 1 || written%100 == 0 {
-				log.Printf("csv: written rows=%d", written)
-			}
+			log.Printf("csv: written rows=%d", written)
 		}
 		writer.Flush()
 		if err := writer.Error(); err != nil {
@@ -1367,8 +1371,8 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 	total := len(srids)
 	stallTicker := time.NewTicker(30 * time.Second)
 	defer stallTicker.Stop()
-	var lastProgressNano int64
-	atomic.StoreInt64(&lastProgressNano, time.Now().UnixNano())
+	uiHeartbeatTicker := time.NewTicker(2 * time.Second)
+	defer uiHeartbeatTicker.Stop()
 	for i, srid := range srids {
 		select {
 		case <-ctx.Done():
@@ -1415,9 +1419,11 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 					}
 				}
 			}
-			if doneCount == 1 || doneCount%100 == 0 {
-				log.Printf("progress: downloaded %d/%d", doneCount, total)
-			}
+			log.Printf("progress: downloaded %d/%d", doneCount, total)
+		case <-uiHeartbeatTicker.C:
+			lastProg := atomic.LoadInt64(&lastProgressNano)
+			age := time.Since(time.Unix(0, lastProg)).Truncate(time.Second)
+			setStatus(fmt.Sprintf("Downloaded %d/%d (last progress %s ago)...", doneCount, total, age))
 		case <-stallTicker.C:
 			last := atomic.LoadInt64(&lastProgressNano)
 			if time.Since(time.Unix(0, last)) >= stallTimeout {
