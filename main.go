@@ -40,17 +40,19 @@ import (
 const (
 	keyringService  = "submissions-ddan"
 	keyringUser     = "api-key"
+	keyringUUID     = "client-uuid"
+	keyringUUIDOld  = "client-uuid_OLD"
 	prefAnalyzerURL = "analyzer_url"
 	prefClientUUID  = "client_uuid"
 	prefIgnoreTLS   = "ignore_tls"
 	prefOutputDir   = "output_dir"
 
-	apiCallInterval     = 1 * time.Millisecond
-	getReportGoroutines = 60                     // concurrent workers for SampleInfo/GetReport; higher = faster, but more load on analyzer and local CPU
+	apiCallInterval     = 10 * time.Millisecond
+	getReportGoroutines = 10                     // concurrent workers for SampleInfo/GetReport; higher = faster, but more load on analyzer and local CPU
 	apiLogEvery         = uint64(1)              // log every N-th API call (1 = log each call); increase to reduce log volume
 	apiLogMinInterval   = 500 * time.Millisecond // minimum interval between API log lines even if apiLogEvery would allow more
 	apiCallTimeout      = 2 * time.Minute        // per API call timeout; prevents a single hung request from stalling the whole export
-	stallTimeout        = 5 * time.Minute        // abort export if no SRID completes / rows are written for this long (covers SDK/network hangs that ignore context)
+	stallTimeout        = 1 * time.Minute        // abort export if no SRID completes / rows are written for this long (covers SDK/network hangs that ignore context)
 
 	progressConnect    = 0.02 // progress after connecting starts; should be < progressListStart
 	progressListStart  = 0.05 // progress when "Fetching submission list" starts; should be > progressConnect and <= progressDoneStart
@@ -280,16 +282,59 @@ func (w *WizardApp) ensureClientUUID() string {
 		if u != "" {
 			return u
 		}
+		stored, err := keyring.Get(keyringService, keyringUUID)
+		if err == nil {
+			stored = strings.TrimSpace(stored)
+			if stored != "" {
+				w.clientUUID = stored
+				return stored
+			}
+		}
 		w.clientUUID = uuid.NewString()
+		_ = keyring.Set(keyringService, keyringUUID, w.clientUUID)
 		return w.clientUUID
 	}
-	u := strings.TrimSpace(w.app.Preferences().String(prefClientUUID))
-	if u != "" {
-		return u
+	stored, err := keyring.Get(keyringService, keyringUUID)
+	if err == nil {
+		stored = strings.TrimSpace(stored)
+		if stored != "" {
+			return stored
+		}
 	}
 	newID := uuid.NewString()
-	w.app.Preferences().SetString(prefClientUUID, newID)
+	_ = keyring.Set(keyringService, keyringUUID, newID)
 	return newID
+}
+
+func (w *WizardApp) rotateClientUUIDForRegister(forceUUID string) (newUUID, oldUUID string, err error) {
+	forceUUID = strings.TrimSpace(forceUUID)
+	if forceUUID != "" {
+		_ = keyring.Delete(keyringService, keyringUUIDOld)
+		if err := keyring.Set(keyringService, keyringUUID, forceUUID); err != nil {
+			return "", "", err
+		}
+		return forceUUID, "", nil
+	}
+
+	cur, err := keyring.Get(keyringService, keyringUUID)
+	if err == nil {
+		cur = strings.TrimSpace(cur)
+		if cur != "" {
+			oldUUID = cur
+			_ = keyring.Set(keyringService, keyringUUIDOld, cur)
+		}
+	}
+
+	newUUID = uuid.NewString()
+	if err := keyring.Set(keyringService, keyringUUID, newUUID); err != nil {
+		return "", "", err
+	}
+	return newUUID, oldUUID, nil
+}
+
+func (w *WizardApp) deleteStoredClientUUIDs() {
+	_ = keyring.Delete(keyringService, keyringUUID)
+	_ = keyring.Delete(keyringService, keyringUUIDOld)
 }
 
 func (w *WizardApp) saveAPIKey(key string) error {
@@ -474,7 +519,9 @@ func (w *WizardApp) bestEffortUnregister() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = client.Unregister(ctx)
+	if err := client.Unregister(ctx); err == nil {
+		w.deleteStoredClientUUIDs()
+	}
 }
 
 func (w *WizardApp) showIntroScreen() {
@@ -1034,12 +1081,36 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 	testCancel()
 
 	setStatus("Registering...")
+	newUUID, oldUUID, err := w.rotateClientUUIDForRegister(w.clientUUID)
+	if err != nil {
+		return fmt.Errorf("prepare client uuid: %w", err)
+	}
+	client.SetUUID(newUUID)
 	regCtx, regCancel := context.WithTimeout(ctx, apiCallTimeout)
 	if err := client.Register(regCtx); err != nil {
 		regCancel()
-		return fmt.Errorf("register: %w", err)
+		if errors.Is(err, ddan.ErrAlreadyRegistered) {
+			if strings.TrimSpace(oldUUID) == "" {
+				return fmt.Errorf("client already registered in Analyzer; please reset registration in Analyzer Web UI (Submitters list) and retry")
+			}
+			client.SetUUID(oldUUID)
+			regCtx2, regCancel2 := context.WithTimeout(ctx, apiCallTimeout)
+			err2 := client.Register(regCtx2)
+			regCancel2()
+			if err2 == nil {
+				_ = keyring.Set(keyringService, keyringUUID, oldUUID)
+				_ = keyring.Delete(keyringService, keyringUUIDOld)
+			} else if errors.Is(err2, ddan.ErrAlreadyRegistered) {
+				return fmt.Errorf("client already registered in Analyzer; please reset registration in Analyzer Web UI (Submitters list) and retry")
+			} else {
+				return fmt.Errorf("register with old uuid: %w", err2)
+			}
+		} else {
+			return fmt.Errorf("register: %w", err)
+		}
 	}
 	regCancel()
+	_ = keyring.Delete(keyringService, keyringUUIDOld)
 	log.Printf("registered")
 
 	w.mu.Lock()
