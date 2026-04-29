@@ -1225,8 +1225,6 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 	rowsCh := make(chan reportRow, workers)
 	var apiSeq uint64
 	var lastAPILogNano int64
-	var lastProgressNano int64
-	atomic.StoreInt64(&lastProgressNano, time.Now().UnixNano())
 
 	var wg sync.WaitGroup
 	for wi := 0; wi < workers; wi++ {
@@ -1343,7 +1341,6 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 				return
 			}
 			written++
-			atomic.StoreInt64(&lastProgressNano, time.Now().UnixNano())
 			writer.Flush()
 			if err := writer.Error(); err != nil {
 				select {
@@ -1394,6 +1391,8 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 	doneCount := 0
 	lastUIUpdateNano := int64(0)
 	uiUpdateMinInterval := 200 * time.Millisecond
+	stallLastDoneCount := 0
+	stallLastDoneTime := time.Now()
 	for doneCount < total {
 		select {
 		case err := <-errCh:
@@ -1408,7 +1407,7 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 			return ctx.Err()
 		case <-completed:
 			doneCount++
-			atomic.StoreInt64(&lastProgressNano, time.Now().UnixNano())
+			stallLastDoneTime = time.Now()
 			now := time.Now().UnixNano()
 			last := atomic.LoadInt64(&lastUIUpdateNano)
 			if doneCount == 1 || doneCount == total || now-last >= uiUpdateMinInterval.Nanoseconds() {
@@ -1421,17 +1420,17 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 			}
 			log.Printf("progress: downloaded %d/%d", doneCount, total)
 		case <-uiHeartbeatTicker.C:
-			lastProg := atomic.LoadInt64(&lastProgressNano)
-			age := time.Since(time.Unix(0, lastProg)).Truncate(time.Second)
+			age := time.Since(stallLastDoneTime).Truncate(time.Second)
 			setStatus(fmt.Sprintf("Downloaded %d/%d (last progress %s ago)...", doneCount, total, age))
 		case <-stallTicker.C:
-			last := atomic.LoadInt64(&lastProgressNano)
-			if time.Since(time.Unix(0, last)) >= stallTimeout {
+			if doneCount == stallLastDoneCount && time.Since(stallLastDoneTime) >= stallTimeout {
 				wg.Wait()
 				close(rowsCh)
 				writeWG.Wait()
-				return fmt.Errorf("stalled for %s without progress", stallTimeout)
+				return fmt.Errorf("stalled for %s without progress (stuck at %d/%d)", stallTimeout, doneCount, total)
 			}
+			stallLastDoneCount = doneCount
+			stallLastDoneTime = time.Now()
 		}
 	}
 	wg.Wait()
