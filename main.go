@@ -51,8 +51,8 @@ const (
 	getReportGoroutines = 10                     // concurrent workers for SampleInfo/GetReport; higher = faster, but more load on analyzer and local CPU
 	apiLogEvery         = uint64(1)              // log every N-th API call (1 = log each call); increase to reduce log volume
 	apiLogMinInterval   = 500 * time.Millisecond // minimum interval between API log lines even if apiLogEvery would allow more
-	apiCallTimeout      = 2 * time.Minute        // per API call timeout; prevents a single hung request from stalling the whole export
-	stallTimeout        = 1 * time.Minute        // abort export if no SRID completes / rows are written for this long (covers SDK/network hangs that ignore context)
+	apiCallTimeout      = 30 * time.Second       // per API call timeout; prevents a single hung request from stalling the whole export
+	stallTimeout        = 30 * time.Second       // abort export if no SRID completes for this long (covers SDK/network hangs that ignore context)
 
 	progressConnect    = 0.02 // progress after connecting starts; should be < progressListStart
 	progressListStart  = 0.05 // progress when "Fetching submission list" starts; should be > progressConnect and <= progressDoneStart
@@ -73,6 +73,7 @@ const (
 var embeddedImagesFS embed.FS
 
 var appVersion = "dev"
+var buildTime = "unknown"
 
 type WizardApp struct {
 	app           fyne.App
@@ -463,7 +464,7 @@ func (w *WizardApp) initLogging() {
 	log.SetOutput(f)
 	host, _ := os.Hostname()
 	log.Printf("logging started: %s", w.logPath)
-	log.Printf("app: version=%s os=%s arch=%s host=%q", appVersion, runtime.GOOS, runtime.GOARCH, strings.TrimSpace(host))
+	log.Printf("app: version=%s built=%s os=%s arch=%s host=%q", appVersion, buildTime, runtime.GOOS, runtime.GOARCH, strings.TrimSpace(host))
 	log.Printf("config: workers=%d api_interval=%s api_timeout=%s stall_timeout=%s api_log_every=%d api_log_min_interval=%s", getReportGoroutines, apiCallInterval, apiCallTimeout, stallTimeout, apiLogEvery, apiLogMinInterval)
 }
 
@@ -1017,7 +1018,8 @@ func (w *WizardApp) showDownloadScreen() {
 }
 
 func (w *WizardApp) downloadAndGenerateCSV(progressData binding.Float, statusData binding.String, backBtn *widget.Button) {
-	ctx := context.Background()
+	ctx, cancelExport := context.WithCancel(context.Background())
+	defer cancelExport()
 	if w.verbose {
 		ctx = ddan.VerboseContext(ctx, func(line string) {
 			log.Printf("ddan: %s", strings.TrimSpace(line))
@@ -1222,6 +1224,7 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 	jobs := make(chan reportJob, jobBuf)
 	completed := make(chan int, len(srids))
 	errCh := make(chan error, 1)
+	writerErrCh := make(chan error, 1)
 	rowsCh := make(chan reportRow, workers)
 	var apiSeq uint64
 	var lastAPILogNano int64
@@ -1333,20 +1336,14 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 				rec = append(rec, m[k])
 			}
 			if err := writer.Write(rec); err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
+				writerErrCh <- err
 				rateCancel()
 				return
 			}
 			written++
 			writer.Flush()
 			if err := writer.Error(); err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
+				writerErrCh <- err
 				rateCancel()
 				return
 			}
@@ -1354,10 +1351,7 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 		}
 		writer.Flush()
 		if err := writer.Error(); err != nil {
-			select {
-			case errCh <- err:
-			default:
-			}
+			writerErrCh <- err
 			rateCancel()
 			return
 		}
@@ -1366,17 +1360,13 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 
 	queued := 0
 	total := len(srids)
-	stallTicker := time.NewTicker(30 * time.Second)
+	stallTicker := time.NewTicker(5 * time.Second)
 	defer stallTicker.Stop()
 	uiHeartbeatTicker := time.NewTicker(2 * time.Second)
 	defer uiHeartbeatTicker.Stop()
 	for i, srid := range srids {
 		select {
 		case <-ctx.Done():
-			close(jobs)
-			wg.Wait()
-			close(rowsCh)
-			writeWG.Wait()
 			return ctx.Err()
 		case jobs <- reportJob{idx: i, srid: srid}:
 		}
@@ -1396,14 +1386,10 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 	for doneCount < total {
 		select {
 		case err := <-errCh:
-			wg.Wait()
-			close(rowsCh)
-			writeWG.Wait()
 			return err
+		case err := <-writerErrCh:
+			return fmt.Errorf("csv writer: %w", err)
 		case <-ctx.Done():
-			wg.Wait()
-			close(rowsCh)
-			writeWG.Wait()
 			return ctx.Err()
 		case <-completed:
 			doneCount++
@@ -1423,14 +1409,12 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 			age := time.Since(stallLastDoneTime).Truncate(time.Second)
 			setStatus(fmt.Sprintf("Downloaded %d/%d (last progress %s ago)...", doneCount, total, age))
 		case <-stallTicker.C:
-			if doneCount == stallLastDoneCount && time.Since(stallLastDoneTime) >= stallTimeout {
-				wg.Wait()
-				close(rowsCh)
-				writeWG.Wait()
+			if doneCount > stallLastDoneCount {
+				stallLastDoneCount = doneCount
+				stallLastDoneTime = time.Now()
+			} else if time.Since(stallLastDoneTime) >= stallTimeout {
 				return fmt.Errorf("stalled for %s without progress (stuck at %d/%d)", stallTimeout, doneCount, total)
 			}
-			stallLastDoneCount = doneCount
-			stallLastDoneTime = time.Now()
 		}
 	}
 	wg.Wait()
