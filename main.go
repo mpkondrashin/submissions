@@ -1256,17 +1256,11 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 				si, err := client.SampleInfo(siCtx, job.srid)
 				siCancel()
 				if err != nil {
-					if errors.Is(err, context.DeadlineExceeded) {
-						rowsCh <- reportRow{SRID: job.srid, DownloadError: err.Error()}
-						completed <- job.idx
-						continue
-					}
-					select {
-					case errCh <- fmt.Errorf("sample info srid=%s: %w", job.srid, err):
-					default:
-					}
-					rateCancel()
-					return
+					// Record any SampleInfo error in CSV and continue
+					log.Printf("api: SampleInfo error srid=%s: %v", job.srid, err)
+					rowsCh <- reportRow{SRID: job.srid, DownloadError: err.Error()}
+					completed <- job.idx
+					continue
 				}
 
 				if err := acquireRate(); err != nil {
@@ -1290,17 +1284,11 @@ func (w *WizardApp) runExport(ctx context.Context, setProgress func(float64), se
 				rep, err := client.GetReport(repCtx, si.SHA1MessageID)
 				repCancel()
 				if err != nil {
-					if errors.Is(err, context.DeadlineExceeded) {
-						rowsCh <- reportRow{SRID: job.srid, SampleInfo: si, DownloadError: err.Error()}
-						completed <- job.idx
-						continue
-					}
-					select {
-					case errCh <- fmt.Errorf("get report sha1=%s: %w", si.SHA1MessageID, err):
-					default:
-					}
-					rateCancel()
-					return
+					// Record any GetReport error (timeout, invalid sha1, etc.) in CSV and continue
+					log.Printf("api: GetReport error srid=%s sha1=%s: %v", job.srid, si.SHA1MessageID, err)
+					rowsCh <- reportRow{SRID: job.srid, SampleInfo: si, DownloadError: err.Error()}
+					completed <- job.idx
+					continue
 				}
 
 				var far *report27.FILEANALYZEREPORT
